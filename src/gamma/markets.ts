@@ -109,19 +109,30 @@ export async function discoverMarkets(windowMinutes: number): Promise<Discovered
   return out;
 }
 
-/** Upsert discovered markets into Postgres so we have a persistent record. */
+/** Upsert discovered markets in a single round-trip per chunk (was per-row). */
 export async function persistMarkets(markets: DiscoveredMarket[]): Promise<void> {
-  for (const m of markets) {
+  if (markets.length === 0) return;
+  const CHUNK = 100;
+  for (let i = 0; i < markets.length; i += CHUNK) {
+    const slice = markets.slice(i, i + CHUNK);
+    const params: unknown[] = [];
+    const values = slice
+      .map((m) => {
+        const j = params.length;
+        params.push(m.conditionId, m.slug, m.question, m.windowMinutes, m.yesTokenId, m.noTokenId, m.endDateIso);
+        return `($${j + 1}, $${j + 2}, $${j + 3}, 'BTC', $${j + 4}, $${j + 5}, $${j + 6}, $${j + 7}, false, now())`;
+      })
+      .join(", ");
     await query(
       `insert into arb.markets
          (condition_id, slug, question, asset, window_minutes, yes_token_id, no_token_id,
           end_date_iso, closed, updated_at)
-       values ($1, $2, $3, 'BTC', $4, $5, $6, $7, false, now())
+       values ${values}
        on conflict (condition_id) do update set
          end_date_iso = excluded.end_date_iso,
          closed       = excluded.closed,
          updated_at   = now()`,
-      [m.conditionId, m.slug, m.question, m.windowMinutes, m.yesTokenId, m.noTokenId, m.endDateIso],
+      params,
     );
   }
 }
