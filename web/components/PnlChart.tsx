@@ -19,7 +19,8 @@ export default function PnlChart({ data }: { data: DailyPnl[] }) {
           <YAxis
             stroke="#999"
             tick={{ fontSize: 11 }}
-            tickFormatter={(v) => `$${v.toFixed(0)}`}
+            domain={["dataMin - 0.05", "dataMax + 0.05"]}
+            tickFormatter={(v) => (Math.abs(v) < 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(2)}`)}
           />
           <Tooltip
             contentStyle={{ background: "#111", border: "1px solid #333", color: "#eee" }}

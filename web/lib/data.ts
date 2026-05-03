@@ -139,6 +139,29 @@ export async function getDailyPnl(): Promise<DailyPnl[]> {
   return rows;
 }
 
+export interface Capital {
+  starting: number; // pUSD value on day 0 (current balance back-calculated by net PnL)
+  current: number; // current pUSD + value of open positions
+}
+
+/**
+ * Starting capital is back-calculated as `current_pusd - cumulative_pnl`,
+ * which equals the day-0 balance regardless of intermediate flows. Current
+ * capital is on-chain pUSD plus the marked value of any open positions.
+ */
+export async function getCapital(
+  funds: FundsSnapshot,
+  pnl: DailyPnl[],
+  positions: Position[],
+): Promise<Capital> {
+  const cumPnl = pnl.length > 0 ? pnl[pnl.length - 1]!.cumulative : 0;
+  const openValue = positions.reduce((s, p) => s + p.currentValue, 0);
+  return {
+    starting: funds.pUsd + openValue - cumPnl,
+    current: funds.pUsd + openValue,
+  };
+}
+
 export interface BotStats {
   signals_today: number;
   arb_hits_today: number;

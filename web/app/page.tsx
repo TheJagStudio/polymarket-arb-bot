@@ -1,4 +1,4 @@
-import { getFunds, getPositions, getTrades, getDailyPnl, getBotStats } from "@/lib/data";
+import { getFunds, getPositions, getTrades, getDailyPnl, getBotStats, getCapital } from "@/lib/data";
 import PnlChart from "@/components/PnlChart";
 
 export const revalidate = 30;
@@ -27,6 +27,7 @@ export default async function Home() {
   const todayKey = new Date().toISOString().slice(0, 10);
   const today = pnl.find((d) => d.date === todayKey);
   const openExposure = positions.reduce((s, p) => s + p.currentValue, 0);
+  const capital = await getCapital(funds, pnl, positions);
 
   return (
     <main className="max-w-6xl mx-auto p-6 space-y-6">
@@ -36,12 +37,17 @@ export default async function Home() {
         <p className="text-xs text-zinc-600 mt-2 font-mono">proxy: {funds.proxy}</p>
       </header>
 
-      <section className="grid grid-cols-2 md:grid-cols-5 gap-3">
+      <section className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <Stat label="Starting capital" value={`$${capital.starting.toFixed(2)}`} />
+        <Stat label="Current capital" value={`$${capital.current.toFixed(2)}`} tone={signTone(capital.current - capital.starting)} />
+        <Stat label="Lifetime PnL" value={dollars(lifetimeRealized)} tone={signTone(lifetimeRealized)} />
+        <Stat label="PnL today" value={dollars(today?.netUsd ?? 0)} tone={signTone(today?.netUsd ?? 0)} />
+      </section>
+
+      <section className="grid grid-cols-2 md:grid-cols-3 gap-3">
         <Stat label="pUSD" value={`$${funds.pUsd.toFixed(2)}`} />
         <Stat label="POL (gas)" value={funds.pol.toFixed(2)} />
         <Stat label="Open exposure" value={`$${openExposure.toFixed(2)}`} />
-        <Stat label="PnL today" value={dollars(today?.netUsd ?? 0)} tone={signTone(today?.netUsd ?? 0)} />
-        <Stat label="Lifetime PnL" value={dollars(lifetimeRealized)} tone={signTone(lifetimeRealized)} />
       </section>
 
       {stats && (
