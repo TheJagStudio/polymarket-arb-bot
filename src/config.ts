@@ -21,7 +21,8 @@ const schema = z.object({
   POSTGRES_URL_NON_POOLING: z.string().url(),
 
   // Strategy
-  ARB_THRESHOLD: z.coerce.number().min(0.5).max(0.999).default(0.97),
+  // <1.0 = real arb (positive edge). >1.0 = intentionally lossy, for live testing.
+  ARB_THRESHOLD: z.coerce.number().min(0.5).max(1.5).default(0.97),
   SHARES_PER_LEG: z.coerce.number().min(5).default(10),
   MAX_DAILY_TRADES: z.coerce.number().int().default(20),
   MAX_OPEN_EXPOSURE_USD: z.coerce.number().default(200),
