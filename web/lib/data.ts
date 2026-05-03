@@ -162,6 +162,100 @@ export async function getCapital(
   };
 }
 
+export interface DecisionLogEntry {
+  observedAt: string;
+  windowMinutes: number;
+  marketSlug: string | null;
+  yesAsk: number;
+  noAsk: number;
+  sumAsk: number;
+  edge: number;
+  threshold: number;
+  decision: "executed" | "skipped";
+  reasoning: string;
+  orderCount: number;
+  orderStatus: string | null;
+}
+
+export async function getDecisionLog(limit = 50): Promise<DecisionLogEntry[]> {
+  if (!pool) return [];
+  try {
+    const r = await pool.query<{
+      observed_at: Date;
+      window_minutes: number | null;
+      slug: string | null;
+      yes_best_ask: string;
+      no_best_ask: string;
+      sum_ask: string;
+      edge: string;
+      threshold: string;
+      would_execute: boolean;
+      skipped_reason: string | null;
+      order_count: string;
+      order_status: string | null;
+    }>(
+      `select
+         s.observed_at,
+         m.window_minutes,
+         m.slug,
+         s.yes_best_ask::text,
+         s.no_best_ask::text,
+         s.sum_ask::text,
+         s.edge::text,
+         s.threshold::text,
+         s.would_execute,
+         s.skipped_reason,
+         coalesce(o.cnt, 0)::text as order_count,
+         o.last_status as order_status
+       from arb.signals s
+       left join arb.markets m on m.condition_id = s.condition_id
+       left join lateral (
+         select count(*) as cnt, max(status) as last_status
+         from arb.orders where signal_id = s.id
+       ) o on true
+       order by s.observed_at desc
+       limit $1`,
+      [limit],
+    );
+
+    return r.rows.map((row) => {
+      const sum = Number(row.sum_ask);
+      const edge = Number(row.edge);
+      const threshold = Number(row.threshold);
+      const oc = Number(row.order_count);
+      let reasoning: string;
+      if (row.would_execute) {
+        reasoning = `sum $${sum.toFixed(3)} ≤ threshold $${threshold.toFixed(2)} → locked edge $${edge.toFixed(3)}/share`;
+      } else {
+        const skip = row.skipped_reason ?? "unknown";
+        const map: Record<string, string> = {
+          inflight: "already trading this market — skip duplicate fire",
+          dl: "halted (silent risk gate)",
+        };
+        const human = map[skip] ?? skip.replace(/-/g, " ");
+        reasoning = `arb hit (sum $${sum.toFixed(3)}, edge $${edge.toFixed(3)}) but ${human}`;
+      }
+      return {
+        observedAt: row.observed_at.toISOString(),
+        windowMinutes: row.window_minutes ?? 0,
+        marketSlug: row.slug,
+        yesAsk: Number(row.yes_best_ask),
+        noAsk: Number(row.no_best_ask),
+        sumAsk: sum,
+        edge,
+        threshold,
+        decision: row.would_execute ? "executed" : "skipped",
+        reasoning,
+        orderCount: oc,
+        orderStatus: row.order_status,
+      };
+    });
+  } catch (e) {
+    console.error("getDecisionLog failed:", e);
+    return [];
+  }
+}
+
 export interface BotStats {
   signals_today: number;
   arb_hits_today: number;

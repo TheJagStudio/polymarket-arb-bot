@@ -1,4 +1,6 @@
-import { getFunds, getPositions, getTrades, getDailyPnl, getBotStats, getCapital } from "@/lib/data";
+import {
+  getFunds, getPositions, getTrades, getDailyPnl, getBotStats, getCapital, getDecisionLog,
+} from "@/lib/data";
 import PnlChart from "@/components/PnlChart";
 
 export const revalidate = 30;
@@ -15,12 +17,13 @@ export default async function Home() {
       console.error("dashboard fetch failed:", e);
       return fallback;
     });
-  const [funds, positions, trades, pnl, stats] = await Promise.all([
+  const [funds, positions, trades, pnl, stats, decisions] = await Promise.all([
     safe(getFunds(), { pUsd: 0, pol: 0, proxy: "0x" }),
     safe(getPositions(), []),
     safe(getTrades(50), []),
     safe(getDailyPnl(), []),
     safe(getBotStats(), null),
+    safe(getDecisionLog(50), []),
   ]);
 
   const lifetimeRealized = pnl.length > 0 ? pnl[pnl.length - 1]!.cumulative : 0;
@@ -77,6 +80,27 @@ export default async function Home() {
             { h: "Avg", c: (p) => `$${p.avgPrice.toFixed(2)}`, align: "right" },
             { h: "Value", c: (p) => `$${p.currentValue.toFixed(2)}`, align: "right" },
             { h: "PnL", c: (p) => dollars(p.cashPnl), align: "right", tone: (p) => signTone(p.cashPnl) },
+          ]}
+        />
+      </section>
+
+      <section className="bg-zinc-950 border border-zinc-800 rounded-lg overflow-hidden">
+        <h2 className="text-sm uppercase tracking-wider text-zinc-400 px-4 py-3 border-b border-zinc-800">
+          Decision log ({decisions.length})
+        </h2>
+        <Table
+          empty="No threshold-hits yet — book sums sitting above the configured edge."
+          rows={decisions}
+          columns={[
+            { h: "Time", c: (d) => new Date(d.observedAt).toLocaleString() },
+            { h: "Window", c: (d) => (d.windowMinutes ? `${d.windowMinutes}m` : "—") },
+            { h: "Yes ask", c: (d) => `$${d.yesAsk.toFixed(3)}`, align: "right" },
+            { h: "No ask", c: (d) => `$${d.noAsk.toFixed(3)}`, align: "right" },
+            { h: "Sum", c: (d) => `$${d.sumAsk.toFixed(3)}`, align: "right" },
+            { h: "Edge", c: (d) => `$${d.edge.toFixed(3)}`, align: "right", tone: (d) => signTone(d.edge) },
+            { h: "Decision", c: (d) => d.decision.toUpperCase(), tone: (d) => (d.decision === "executed" ? "pos" : "neg") },
+            { h: "Reasoning", c: (d) => d.reasoning },
+            { h: "Orders", c: (d) => (d.orderCount > 0 ? `${d.orderCount} ${d.orderStatus ?? ""}`.trim() : "—") },
           ]}
         />
       </section>
