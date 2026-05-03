@@ -14,11 +14,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@polymarket/clob-client": "^4.20.0",
+    "@polymarket/clob-client-v2": "^1.0.2",
     "dotenv": "^16.4.5",
     "pg": "^8.13.1",
     "pino": "^9.5.0",
     "pino-pretty": "^11.3.0",
+    "viem": "^2.22.0",
     "ws": "^8.18.0",
     "zod": "^3.23.8"
   },
