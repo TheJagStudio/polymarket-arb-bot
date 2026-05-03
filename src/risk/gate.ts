@@ -1,6 +1,57 @@
-import { getConfig } from "../config.js";
+import { createPublicClient, http, formatUnits, erc20Abi, type Address } from "viem";
+import { polygon } from "viem/chains";
+import { privateKeyToAccount } from "viem/accounts";
+import { getConfig, resolveFunder } from "../config.js";
 import { query } from "../db/client.js";
 import { logger } from "../logger.js";
+
+const PUSD_ADDR = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB" as const;
+let _rpc: ReturnType<typeof createPublicClient> | null = null;
+function rpc() {
+  if (!_rpc) _rpc = createPublicClient({ chain: polygon, transport: http() });
+  return _rpc;
+}
+
+/** Read on-chain pUSD balance of the funder (proxy). */
+async function fetchPusdBalance(): Promise<number> {
+  const cfg = getConfig();
+  const account = privateKeyToAccount(cfg.PRIVATE_KEY as `0x${string}`);
+  const funder = resolveFunder(cfg, account.address) as Address;
+  const bal = await rpc().readContract({
+    address: PUSD_ADDR,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [funder],
+  });
+  return Number(formatUnits(bal, 6));
+}
+
+/**
+ * Snapshot today's opening pUSD balance once per day. If a snapshot already
+ * exists, returns the stored value. Returns null on RPC failure (caller
+ * should fail-open in that rare case).
+ */
+async function getOpeningPusd(): Promise<number | null> {
+  const today = new Date().toISOString().slice(0, 10);
+  const existing = await query<{ opening_pusd: string }>(
+    `select opening_pusd from arb.daily_balance_snapshot where day = $1`,
+    [today],
+  );
+  if (existing.rows[0]) return Number(existing.rows[0].opening_pusd);
+
+  let bal: number;
+  try {
+    bal = await fetchPusdBalance();
+  } catch {
+    return null;
+  }
+  await query(
+    `insert into arb.daily_balance_snapshot (day, opening_pusd) values ($1, $2)
+     on conflict (day) do nothing`,
+    [today, bal],
+  );
+  return bal;
+}
 
 export interface RiskCheck {
   allowed: boolean;
@@ -45,6 +96,21 @@ export async function canTrade(notionalUsd: number): Promise<RiskCheck> {
       allowed: false,
       reason: `exposure-cap (${openExposure.toFixed(2)} + ${notionalUsd.toFixed(2)} > ${cfg.MAX_OPEN_EXPOSURE_USD})`,
     };
+  }
+
+  // Daily-loss kill switch: snapshot opening pUSD; if drawdown exceeds cap, halt.
+  const opening = await getOpeningPusd();
+  if (opening !== null) {
+    let current: number;
+    try {
+      current = await fetchPusdBalance();
+    } catch {
+      return { allowed: true }; // fail-open on RPC blip
+    }
+    const drawdown = opening - current;
+    if (drawdown > cfg.MAX_DAILY_LOSS_USD) {
+      return { allowed: false, reason: `dl` }; // intentionally terse
+    }
   }
 
   return { allowed: true };

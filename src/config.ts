@@ -26,6 +26,7 @@ const schema = z.object({
   SHARES_PER_LEG: z.coerce.number().min(5).default(10),
   MAX_DAILY_TRADES: z.coerce.number().int().default(20),
   MAX_OPEN_EXPOSURE_USD: z.coerce.number().default(200),
+  MAX_DAILY_LOSS_USD: z.coerce.number().default(20),
   WINDOW_MINUTES: z
     .string()
     .default("5,15")
