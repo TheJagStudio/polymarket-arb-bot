@@ -4,6 +4,7 @@ import { closeDb } from "./db/client.js";
 import { discoverMarkets, persistMarkets, type DiscoveredMarket } from "./gamma/markets.js";
 import { MarketWs, type BookUpdate } from "./clob/marketWs.js";
 import { evaluate } from "./exec/executor.js";
+import { startReconciler } from "./exec/reconciler.js";
 import { getClobClient } from "./clob/client.js";
 
 const REDISCOVER_INTERVAL_MS = 60_000; // re-poll Gamma every 60s for new short-lived markets
@@ -76,6 +77,9 @@ async function main(): Promise<void> {
   };
   subscribe(watching);
 
+  // Periodic reconciler — flattens any stranded positions in still-open markets.
+  const reconcilerTimer = startReconciler();
+
   // Periodic re-discovery — short-window markets churn every few minutes.
   const interval = setInterval(async () => {
     try {
@@ -98,6 +102,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string) => {
     logger.info({ signal }, "shutting down");
     clearInterval(interval);
+    clearInterval(reconcilerTimer);
     ws?.stop();
     await closeDb();
     process.exit(0);
