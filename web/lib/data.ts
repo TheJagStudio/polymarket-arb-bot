@@ -140,14 +140,19 @@ export async function getDailyPnl(): Promise<DailyPnl[]> {
 }
 
 export interface Capital {
-  starting: number; // pUSD value on day 0 (current balance back-calculated by net PnL)
+  starting: number; // pUSD value on day 0
   current: number; // current pUSD + value of open positions
 }
 
 /**
- * Starting capital is back-calculated as `current_pusd - cumulative_pnl`,
- * which equals the day-0 balance regardless of intermediate flows. Current
- * capital is on-chain pUSD plus the marked value of any open positions.
+ * Starting capital comes from the explicit STARTING_CAPITAL_USD env var
+ * (most reliable — set once by the operator). If unset, we fall back to
+ * `current_pusd - cumulative_pnl` which gives the right answer when both
+ * inputs are healthy.
+ *
+ * Current capital is on-chain pUSD plus the marked value of any open
+ * positions. If the RPC read failed (funds.pUsd === 0), we instead derive
+ * it as `starting + cumulative_pnl` so the dashboard stays informative.
  */
 export async function getCapital(
   funds: FundsSnapshot,
@@ -156,10 +161,18 @@ export async function getCapital(
 ): Promise<Capital> {
   const cumPnl = pnl.length > 0 ? pnl[pnl.length - 1]!.cumulative : 0;
   const openValue = positions.reduce((s, p) => s + p.currentValue, 0);
-  return {
-    starting: funds.pUsd + openValue - cumPnl,
-    current: funds.pUsd + openValue,
-  };
+  const envStart = Number(process.env.STARTING_CAPITAL_USD ?? "");
+
+  const starting = Number.isFinite(envStart) && envStart > 0
+    ? envStart
+    : funds.pUsd + openValue - cumPnl;
+
+  // If on-chain read returned 0 (RPC throttled), derive current from PnL.
+  const current = funds.pUsd > 0
+    ? funds.pUsd + openValue
+    : starting + cumPnl + openValue;
+
+  return { starting, current };
 }
 
 export interface DecisionLogEntry {
