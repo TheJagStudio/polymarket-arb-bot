@@ -77,16 +77,91 @@ export async function evaluate(update: BookUpdate): Promise<void> {
       await recordOrder(signalId, update, "NO", update.noTokenId, askNo, shares, "dry_run");
       await bumpDailyCounter();
     } else {
-      await placeLeg(signalId, update, "YES", update.yesTokenId, askYes, shares);
-      await placeLeg(signalId, update, "NO", update.noTokenId, askNo, shares);
-      await bumpDailyCounter();
+      // Fire both legs in parallel to minimise the race window between them.
+      const [yesLeg, noLeg] = await Promise.all([
+        placeLeg(signalId, update, "YES", update.yesTokenId, askYes, shares),
+        placeLeg(signalId, update, "NO", update.noTokenId, askNo, shares),
+      ]);
+
+      // Imbalance handling: if exactly one filled, flatten the orphan immediately.
+      if (yesLeg.filled !== noLeg.filled) {
+        const orphan = yesLeg.filled
+          ? { leg: "YES" as const, tokenId: update.yesTokenId, fillPrice: askYes }
+          : { leg: "NO" as const, tokenId: update.noTokenId, fillPrice: askNo };
+        logger.warn(
+          { cond: update.conditionId.slice(0, 10), orphan: orphan.leg },
+          "🚨 partial fill — unwinding orphan",
+        );
+        await unwindOrphan(signalId, update, orphan.leg, orphan.tokenId, shares);
+      }
+
+      if (yesLeg.filled && noLeg.filled) await bumpDailyCounter();
     }
   } catch (e) {
     logger.error({ err: (e as Error).message, cond: update.conditionId }, "execution failed");
   } finally {
-    // Hold inflight for a couple of seconds so we don't re-fire on the next book diff.
+    // Hold inflight for a few seconds so we don't re-fire on the next book diff.
     setTimeout(() => inflight.delete(update.conditionId), 5_000);
   }
+}
+
+/**
+ * Sells `shares` of `tokenId` at market (FAK so any partial fill counts and
+ * the rest is killed). This is best-effort flattening when one arb leg fills
+ * and the other doesn't — accepting whatever the book offers is preferable
+ * to holding a directional position.
+ */
+async function unwindOrphan(
+  signalId: string,
+  update: BookUpdate,
+  leg: "YES" | "NO",
+  tokenId: string,
+  shares: number,
+): Promise<void> {
+  try {
+    const { client } = await getClobClient();
+    const resp = await client.createAndPostMarketOrder(
+      { tokenID: tokenId, amount: shares, side: Side.SELL, orderType: OrderType.FAK },
+      { tickSize: "0.01", negRisk: false },
+      OrderType.FAK,
+    );
+    const status = resp.success ? (resp.status ?? "submitted") : "unwind_failed";
+    await query(
+      `insert into arb.orders
+         (signal_id, condition_id, token_id, side, leg, price, shares, order_type,
+          dry_run, status, clob_order_id, error_message)
+         values ($1, $2, $3, 'SELL', $4, 0, $5, 'FAK', false, $6, $7, $8)`,
+      [
+        signalId,
+        update.conditionId,
+        tokenId,
+        leg,
+        shares,
+        `unwind:${status}`,
+        resp.orderID ?? null,
+        resp.errorMsg ?? null,
+      ],
+    );
+    logger.info(
+      { leg, status, orderId: resp.orderID, err: resp.errorMsg ?? null },
+      "unwind result",
+    );
+  } catch (e) {
+    logger.error({ err: (e as Error).message, leg }, "unwind threw — orphan still open");
+    await query(
+      `insert into arb.orders
+         (signal_id, condition_id, token_id, side, leg, price, shares, order_type,
+          dry_run, status, error_message)
+         values ($1, $2, $3, 'SELL', $4, 0, $5, 'FAK', false, 'unwind_threw', $6)`,
+      [signalId, update.conditionId, tokenId, leg, shares, (e as Error).message],
+    );
+  }
+}
+
+interface LegResult {
+  filled: boolean;
+  orderId?: string;
+  status: string;
 }
 
 async function placeLeg(
@@ -96,39 +171,40 @@ async function placeLeg(
   tokenId: string,
   price: number,
   shares: number,
-): Promise<void> {
+): Promise<LegResult> {
   const { client } = await getClobClient();
-
-  const tickSize = "0.01"; // BTC up/down markets are 0.01.
+  const tickSize = "0.01";
   const negRisk = false;
   const usdcAmount = shares * price;
 
-  // FOK market order: buys up to `usdcAmount` of shares at any price <= `price`.
-  // If the book moves between detection and execution, the order is killed
-  // rather than filled at a worse price — exactly what we want for arb.
-  const resp = await client.createAndPostMarketOrder(
-    { tokenID: tokenId, price, amount: usdcAmount, side: Side.BUY, orderType: OrderType.FOK },
-    { tickSize, negRisk },
-    OrderType.FOK,
-  );
+  let status = "rejected";
+  let orderId: string | undefined;
+  let errorMsg: string | undefined;
+  try {
+    // FOK market BUY with a price cap — order is killed entirely if the book
+    // moves past our limit, ensuring we never fill at a worse price than the
+    // detector evaluated.
+    const resp = await client.createAndPostMarketOrder(
+      { tokenID: tokenId, price, amount: usdcAmount, side: Side.BUY, orderType: OrderType.FOK },
+      { tickSize, negRisk },
+      OrderType.FOK,
+    );
+    status = resp.success ? (resp.status ?? "submitted") : "rejected";
+    orderId = resp.orderID;
+    errorMsg = resp.errorMsg;
+  } catch (e) {
+    status = "threw";
+    errorMsg = (e as Error).message;
+  }
 
-  const status = resp.success ? (resp.status ?? "submitted") : "rejected";
-  await recordOrder(
-    signalId,
-    update,
-    leg,
-    tokenId,
-    price,
-    shares,
-    status,
-    resp.orderID,
-    resp.errorMsg,
-  );
+  await recordOrder(signalId, update, leg, tokenId, price, shares, status, orderId, errorMsg);
 
-  logger.info(
-    { leg, status, orderId: resp.orderID, err: resp.errorMsg ?? null },
-    "leg result",
-  );
+  // FOK-success on Polymarket reports `status: "matched"` when fully filled.
+  // Treat anything other than matched/filled as not-filled (so the orphan
+  // flattener can react).
+  const filled = status === "matched" || status === "filled";
+  logger.info({ leg, status, filled, orderId, err: errorMsg ?? null }, "leg result");
+  return { filled, orderId, status };
 }
 
 async function recordOrder(
