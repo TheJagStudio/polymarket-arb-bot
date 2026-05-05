@@ -111,6 +111,18 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
+// Catch unhandled rejections (e.g., transient pg pool errors) so a single
+// blip doesn't kill a process that's been running for hours.
+process.on("unhandledRejection", (reason) => {
+  logger.error(
+    { reason: reason instanceof Error ? reason.message : String(reason) },
+    "unhandledRejection — keeping process alive",
+  );
+});
+process.on("uncaughtException", (err) => {
+  logger.error({ err: err.message, stack: err.stack }, "uncaughtException — keeping process alive");
+});
+
 main().catch((err) => {
   logger.error({ err: err instanceof Error ? err.message : err }, "fatal");
   process.exit(1);
