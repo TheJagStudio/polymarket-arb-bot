@@ -5,11 +5,16 @@ import { query } from "../db/client.js";
 import { getClobClient } from "../clob/client.js";
 import { canTrade, bumpAttemptCounter, bumpDailyCounter } from "../risk/gate.js";
 import type { BookUpdate } from "../clob/marketWs.js";
+import {
+  computeUsdcAmount,
+  decideOrphanAction,
+  decideOutcome,
+  isFilledStatus,
+  parseFilledShares,
+  type RawOrderResponse,
+} from "./helpers.js";
 
 const INFLIGHT_COOLDOWN_MS = 5 * 60_000;       // 5 minutes — was 5s, kept re-firing
-const MIN_TIME_TO_SETTLEMENT_MS = 60_000;       // skip last 60s — books too thin
-const MIN_PRICE = 0.05;                         // skip extreme-priced legs (paper-thin asks)
-const MAX_PRICE = 0.95;
 const ALREADY_POSITIONED_LOOKBACK_MIN = 30;     // don't re-enter a market we've touched recently
 
 /** Inflight pairs to prevent firing twice on the same condition before settlement. */
@@ -33,27 +38,12 @@ export async function evaluate(update: BookUpdate): Promise<void> {
   const notional = shares * sum;
 
   // ── Pre-trade safety filters ──────────────────────────────────────────────
-  let skipReason: string | null = null;
+  // Inflight check (cheap) up front so we can skip the DB queries below.
+  const isInflight = inflight.has(update.conditionId);
 
-  // 1. In-flight on this exact market right now.
-  if (!skipReason && inflight.has(update.conditionId)) skipReason = "inflight";
-
-  // 2. Too close to settlement — books thin, partial-fill risk highest.
-  if (!skipReason) {
-    const msToEnd = Date.parse(update.endDateIso) - Date.now();
-    if (msToEnd < MIN_TIME_TO_SETTLEMENT_MS) {
-      skipReason = `too-close-to-settlement (${Math.round(msToEnd / 1000)}s left)`;
-    }
-  }
-
-  // 3. Extreme-priced legs — one side at $0.02 / other at $0.97 means the
-  //    $0.02 side has thin asks; we'll over-buy the cheap side and orphan it.
-  if (!skipReason && (askYes < MIN_PRICE || askNo < MIN_PRICE || askYes > MAX_PRICE || askNo > MAX_PRICE)) {
-    skipReason = `extreme-prices (yes=${askYes.toFixed(3)} no=${askNo.toFixed(3)})`;
-  }
-
-  // 4. Already entered this market recently — don't stack orphans.
-  if (!skipReason) {
+  // Recent-positioning check requires DB; only run if we're past inflight.
+  let recentMatchedCount = 0;
+  if (!isInflight) {
     const recent = await query<{ n: string }>(
       `select count(*)::text as n from arb.orders
         where condition_id = $1
@@ -63,14 +53,29 @@ export async function evaluate(update: BookUpdate): Promise<void> {
           and submitted_at > now() - ($2 || ' minutes')::interval`,
       [update.conditionId, ALREADY_POSITIONED_LOOKBACK_MIN.toString()],
     );
-    if (Number(recent.rows[0]?.n ?? 0) > 0) skipReason = "already-positioned";
+    recentMatchedCount = Number(recent.rows[0]?.n ?? 0);
   }
 
-  // 5. Risk gate (daily caps + exposure + loss limit).
-  if (!skipReason) {
-    const risk = await canTrade(notional);
-    if (!risk.allowed) skipReason = risk.reason ?? "risk";
-  }
+  // Risk gate (daily caps + exposure + loss limit) — runs once we've passed
+  // the cheaper filters. decideOutcome() will only consult `risk` if the
+  // earlier checks passed; we evaluate it eagerly for simplicity.
+  const risk = await canTrade(notional);
+
+  const outcome = decideOutcome({
+    askYes,
+    askNo,
+    threshold: cfg.ARB_THRESHOLD,
+    endDateIso: update.endDateIso,
+    isInflight,
+    recentMatchedCount,
+    risk,
+  });
+
+  // No-signal branch: shouldn't happen here because we already gated on
+  // sum>threshold above, but kept for safety.
+  if (outcome.kind === "no-signal") return;
+
+  const skipReason = outcome.kind === "skip" ? outcome.reason : null;
 
   // ── Persist the signal regardless of decision ─────────────────────────────
   const signalRes = await query<{ id: string }>(
@@ -118,20 +123,20 @@ export async function evaluate(update: BookUpdate): Promise<void> {
         placeLeg(signalId, update, "NO", update.noTokenId, askNo, shares),
       ]);
 
-      // Orphan handling: if exactly one filled, sell the ACTUAL filled
-      // share count (was: configured shares — left residuals when fill > requested).
-      if (yesLeg.filled !== noLeg.filled) {
-        const orphan = yesLeg.filled
-          ? { leg: "YES" as const, tokenId: update.yesTokenId, actualShares: yesLeg.filledShares }
-          : { leg: "NO" as const, tokenId: update.noTokenId, actualShares: noLeg.filledShares };
+      const action = decideOrphanAction(
+        { ...yesLeg, leg: "YES", tokenId: update.yesTokenId },
+        { ...noLeg, leg: "NO", tokenId: update.noTokenId },
+      );
+
+      if (action.kind === "flatten") {
         logger.warn(
-          { cond: update.conditionId.slice(0, 10), orphan: orphan.leg, sharesToSell: orphan.actualShares },
+          { cond: update.conditionId.slice(0, 10), orphan: action.leg, sharesToSell: action.shares },
           "🚨 partial fill — unwinding orphan",
         );
-        await unwindOrphan(signalId, update, orphan.leg, orphan.tokenId, orphan.actualShares);
+        await unwindOrphan(signalId, update, action.leg, action.tokenId, action.shares);
+      } else if (action.kind === "complete") {
+        await bumpDailyCounter();
       }
-
-      if (yesLeg.filled && noLeg.filled) await bumpDailyCounter();
     }
   } catch (e) {
     logger.error({ err: (e as Error).message, cond: update.conditionId }, "execution failed");
@@ -210,25 +215,26 @@ async function placeLeg(
   const { client } = await getClobClient();
   const tickSize = "0.01";
   const negRisk = false;
-  const usdcAmount = shares * price;
+  const usdcAmount = computeUsdcAmount(shares, price);
 
   let status = "rejected";
   let orderId: string | undefined;
   let errorMsg: string | undefined;
   let filledShares = 0;
   try {
-    const resp = await client.createAndPostMarketOrder(
+    const resp = (await client.createAndPostMarketOrder(
       { tokenID: tokenId, price, amount: usdcAmount, side: Side.BUY, orderType: OrderType.FOK },
       { tickSize, negRisk },
       OrderType.FOK,
-    );
+    )) as RawOrderResponse;
     status = resp.success ? (resp.status ?? "submitted") : "rejected";
     orderId = resp.orderID;
     errorMsg = resp.errorMsg;
-    // takingAmount is the conditional-token quantity received (6-decimal fixed point).
-    if (resp.takingAmount) {
-      filledShares = Number(resp.takingAmount) / 1e6;
-    }
+    // The CLOB API frequently returns takingAmount=0 even on successful FOK
+    // matches — parseFilledShares applies multiple strategies (primary
+    // field, cross-derive, request-derive) so we always get a non-zero
+    // share count when the order actually filled.
+    filledShares = parseFilledShares(resp, "BUY", usdcAmount, price);
   } catch (e) {
     status = "threw";
     errorMsg = (e as Error).message;
@@ -236,7 +242,7 @@ async function placeLeg(
 
   await recordOrder(signalId, update, leg, tokenId, price, shares, status, orderId, errorMsg);
 
-  const filled = status === "matched" || status === "filled";
+  const filled = isFilledStatus(status);
   logger.info(
     { leg, status, filled, filledShares, orderId, err: errorMsg ?? null },
     "leg result",
