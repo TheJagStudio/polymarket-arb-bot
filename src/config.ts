@@ -27,6 +27,14 @@ const schema = z.object({
   MAX_DAILY_TRADES: z.coerce.number().int().default(20),
   MAX_OPEN_EXPOSURE_USD: z.coerce.number().default(200),
   MAX_DAILY_LOSS_USD: z.coerce.number().default(20),
+  // Execution mode:
+  //   parallel — fire both FOK BUYs simultaneously (current default; fast but races)
+  //   atomic   — place leg A as resting GTC limit, only fire leg B FOK after A fills
+  //              (eliminates orphan race; slower entry, may not get a fill)
+  STRATEGY_MODE: z.enum(["parallel", "atomic"]).default("parallel"),
+  // Atomic-mode tuning:
+  ATOMIC_LEG_A_TIMEOUT_MS: z.coerce.number().int().default(8_000),  // cancel resting A if not filled in 8s
+  ATOMIC_POLL_MS: z.coerce.number().int().default(500),             // status poll interval
   WINDOW_MINUTES: z
     .string()
     .default("5,15")

@@ -13,6 +13,7 @@ import {
   parseFilledShares,
   type RawOrderResponse,
 } from "./helpers.js";
+import { executeAtomic } from "./atomic.js";
 
 const INFLIGHT_COOLDOWN_MS = 5 * 60_000;       // 5 minutes — was 5s, kept re-firing
 const ALREADY_POSITIONED_LOOKBACK_MIN = 30;     // don't re-enter a market we've touched recently
@@ -117,7 +118,53 @@ export async function evaluate(update: BookUpdate): Promise<void> {
       await recordOrder(signalId, update, "YES", update.yesTokenId, askYes, shares, "dry_run");
       await recordOrder(signalId, update, "NO", update.noTokenId, askNo, shares, "dry_run");
       await bumpDailyCounter();
+    } else if (cfg.STRATEGY_MODE === "atomic") {
+      // Atomic: rest leg A as GTC, only fire leg B FOK after A confirms fill.
+      const result = await executeAtomic({
+        yesTokenId: update.yesTokenId,
+        noTokenId: update.noTokenId,
+        askYes,
+        askNo,
+        shares,
+      });
+
+      // Persist whatever happened.
+      if (result.legA.filled || !result.abandoned) {
+        await recordOrder(
+          signalId, update,
+          askYes <= askNo ? "YES" : "NO",
+          askYes <= askNo ? update.yesTokenId : update.noTokenId,
+          askYes <= askNo ? askYes : askNo,
+          result.legA.filledShares || shares,
+          result.legA.status,
+          result.legA.orderId,
+          result.legA.errorMsg,
+        );
+      }
+      if (result.legB) {
+        await recordOrder(
+          signalId, update,
+          askYes <= askNo ? "NO" : "YES",
+          askYes <= askNo ? update.noTokenId : update.yesTokenId,
+          askYes <= askNo ? askNo : askYes,
+          result.legB.filledShares || shares,
+          result.legB.status,
+          result.legB.orderId,
+          result.legB.errorMsg,
+        );
+      }
+
+      if (result.bothFilled) {
+        await bumpDailyCounter();
+      } else if (result.orphan) {
+        logger.warn(
+          { cond: update.conditionId.slice(0, 10), orphan: result.orphan.leg, sharesToSell: result.orphan.shares },
+          "🚨 atomic: orphan after leg B failed — flattening",
+        );
+        await unwindOrphan(signalId, update, result.orphan.leg, result.orphan.tokenId, result.orphan.shares);
+      }
     } else {
+      // parallel mode (default, current behavior)
       const [yesLeg, noLeg] = await Promise.all([
         placeLeg(signalId, update, "YES", update.yesTokenId, askYes, shares),
         placeLeg(signalId, update, "NO", update.noTokenId, askNo, shares),
