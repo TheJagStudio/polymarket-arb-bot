@@ -1,0 +1,21 @@
+[Unit]
+Description=Polymarket within-market arbitrage bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/polymarket-arb-bot
+ExecStart=/usr/bin/node dist/index.js
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=polymarket-arb-bot
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
